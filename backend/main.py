@@ -95,44 +95,86 @@ def get_nse_session() -> httpx.Client:
 
 
 def nse_get(path: str) -> dict | list:
+    import json
+    import gzip
+
     client = get_nse_session()
     url = NSE_BASE + path
 
-    def _make_request():
-        r = client.get(url, timeout=12)
-
-        # Force-read raw bytes safely
+    def _decode_content(r):
         content = r.content
 
+        encoding = r.headers.get("Content-Encoding", "").lower()
+
         try:
-            return r.json()
+            if "br" in encoding:
+                import brotli
+                content = brotli.decompress(content)
+            elif "gzip" in encoding:
+                content = gzip.decompress(content)
         except Exception:
-            try:
-                import json
-                return json.loads(content.decode("utf-8", errors="ignore"))
-            except Exception:
-                raise Exception(f"Invalid NSE response: {content[:100]}")
+            # If decompression fails, continue with raw content
+            pass
+
+        try:
+            return json.loads(content.decode("utf-8", errors="ignore"))
+        except Exception:
+            raise Exception(f"Invalid NSE response: {content[:100]}")
 
     try:
-        return _make_request()
+        r = client.get(url, timeout=12)
+        r.raise_for_status()
+        return _decode_content(r)
+
     except Exception:
-        # Session may have expired — refresh once and retry
+        # Refresh session and retry once
         global _nse_session_time
         _nse_session_time = 0
 
         client = get_nse_session()
-
         r = client.get(url, timeout=12)
+        r.raise_for_status()
+        return _decode_content(r)def nse_get(path: str) -> dict | list:
+    import json
+    import gzip
+
+    client = get_nse_session()
+    url = NSE_BASE + path
+
+    def _decode_content(r):
         content = r.content
 
+        encoding = r.headers.get("Content-Encoding", "").lower()
+
         try:
-            return r.json()
+            if "br" in encoding:
+                import brotli
+                content = brotli.decompress(content)
+            elif "gzip" in encoding:
+                content = gzip.decompress(content)
         except Exception:
-            try:
-                import json
-                return json.loads(content.decode("utf-8", errors="ignore"))
-            except Exception:
-                raise Exception(f"Invalid NSE response after retry: {content[:100]}")
+            # If decompression fails, continue with raw content
+            pass
+
+        try:
+            return json.loads(content.decode("utf-8", errors="ignore"))
+        except Exception:
+            raise Exception(f"Invalid NSE response: {content[:100]}")
+
+    try:
+        r = client.get(url, timeout=12)
+        r.raise_for_status()
+        return _decode_content(r)
+
+    except Exception:
+        # Refresh session and retry once
+        global _nse_session_time
+        _nse_session_time = 0
+
+        client = get_nse_session()
+        r = client.get(url, timeout=12)
+        r.raise_for_status()
+        return _decode_content(r)
 
 
 # ── Index name map ───────────────────────────────────────────────────────────
