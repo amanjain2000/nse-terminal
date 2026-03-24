@@ -6,9 +6,10 @@ async function req(path) {
   return res.json()
 }
 
-export const fetchIndices = () => req('/api/indices')
-export const fetchSectors = () => req('/api/sectors')
-export const searchStocks = (q) => req(`/api/search?q=${encodeURIComponent(q)}`)
-export const fetchStock = (sym) => req(`/api/stock/${sym}`)
-export const fetchHistory = (sym, period = '1m') =>
-  req(`/api/stock/${sym}/history?period=${period}`)
+export const fetchIndices      = ()            => req('/api/indices')
+export const fetchSectors      = ()            => req('/api/sectors')
+export const searchStocks      = (q)           => req(`/api/search?q=${encodeURIComponent(q)}`)
+export const fetchStock        = (sym)         => req(`/api/stock/${sym}`)
+export const fetchHistory      = (sym, period) => req(`/api/stock/${sym}/history?period=${period || '1m'}`)
+export const fetchFinancials   = (sym)         => req(`/api/stock/${sym}/financials`)
+export const fetchShareholding = (sym)         => req(`/api/stock/${sym}/shareholding`)
