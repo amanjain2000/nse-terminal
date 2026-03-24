@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
+import httpx
 import asyncio
 import time
+import random
 from concurrent.futures import ThreadPoolExecutor
 from stocks_list import NSE_STOCKS
 
@@ -15,145 +17,190 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Single-threaded executor — serializes Yahoo calls, avoids rate limits
 executor = ThreadPoolExecutor(max_workers=3)
 
-# ── In-memory cache ──────────────────────────────────────────────────────────
+# ── Cache ────────────────────────────────────────────────────────────────────
 _cache: dict = {}
 
-def cache_get(key: str):
-    entry = _cache.get(key)
-    if entry and time.time() < entry["exp"]:
-        return entry["val"]
+def cache_get(key):
+    e = _cache.get(key)
+    if e and time.time() < e["exp"]:
+        return e["val"]
     return None
 
-def cache_set(key: str, val, ttl: int):
+def cache_set(key, val, ttl):
     _cache[key] = {"val": val, "exp": time.time() + ttl}
 
-# ── Indices & Sectors ────────────────────────────────────────────────────────
-INDICES = {
-    "NIFTY 50":   "^NSEI",
-    "SENSEX":     "^BSESN",
-    "NIFTY BANK": "^NSEBANK",
-    "NIFTY IT":   "^CNXIT",
-    "NIFTY PHARMA": "^CNXPHARMA",
+# ── NSE Direct Client ────────────────────────────────────────────────────────
+# NSE India's own public API — works from cloud IPs, no auth needed.
+# Pattern: hit the homepage first to get cookies, then call the API.
+
+NSE_BASE    = "https://www.nseindia.com"
+NSE_HEADERS = {
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer":         "https://www.nseindia.com/",
+    "Origin":          "https://www.nseindia.com",
+    "DNT":             "1",
+    "Connection":      "keep-alive",
 }
 
-SECTOR_INDICES = {
-    "IT":       "^CNXIT",
-    "Bank":     "^NSEBANK",
-    "Pharma":   "^CNXPHARMA",
-    "Auto":     "^CNXAUTO",
-    "FMCG":     "^CNXFMCG",
-    "Metal":    "^CNXMETAL",
-    "Realty":   "^CNXREALTY",
-    "Energy":   "^CNXENERGY",
-    "PSU Bank": "^CNXPSUBANK",
-    "Media":    "^CNXMEDIA",
+_nse_session: httpx.Client | None = None
+_nse_session_time: float = 0
+SESSION_TTL = 300   # refresh session every 5 min
+
+
+def get_nse_session() -> httpx.Client:
+    global _nse_session, _nse_session_time
+    if _nse_session and time.time() - _nse_session_time < SESSION_TTL:
+        return _nse_session
+    if _nse_session:
+        try: _nse_session.close()
+        except: pass
+    client = httpx.Client(
+        headers=NSE_HEADERS,
+        follow_redirects=True,
+        timeout=15,
+    )
+    try:
+        # Hit homepage to acquire session cookies
+        client.get(NSE_BASE + "/", timeout=10)
+        time.sleep(0.3)
+    except Exception:
+        pass
+    _nse_session = client
+    _nse_session_time = time.time()
+    return client
+
+
+def nse_get(path: str) -> dict | list:
+    client = get_nse_session()
+    url = NSE_BASE + path
+    try:
+        r = client.get(url, timeout=12)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        # Session may have expired — refresh once and retry
+        global _nse_session_time
+        _nse_session_time = 0
+        client = get_nse_session()
+        r = client.get(url, timeout=12)
+        r.raise_for_status()
+        return r.json()
+
+
+# ── Index name map ───────────────────────────────────────────────────────────
+NSE_INDEX_NAMES = {
+    "NIFTY 50":          "NIFTY 50",
+    "NIFTY BANK":        "NIFTY BANK",
+    "NIFTY IT":          "NIFTY IT",
+    "NIFTY PHARMA":      "NIFTY PHARMA",
+    "NIFTY AUTO":        "NIFTY AUTO",
+    "NIFTY FMCG":        "NIFTY FMCG",
+    "NIFTY METAL":       "NIFTY METAL",
+    "NIFTY REALTY":      "NIFTY REALTY",
+    "NIFTY ENERGY":      "NIFTY ENERGY",
+    "NIFTY PSU BANK":    "NIFTY PSU BANK",
+    "NIFTY MEDIA":       "NIFTY MEDIA",
+    "NIFTY MIDCAP 100":  "NIFTY MIDCAP 100",
+    "INDIA VIX":         "INDIA VIX",
 }
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def _history_price(symbol: str):
-    """Get price+change using history() — far less rate-limited than info()."""
-    t = yf.Ticker(symbol)
-    hist = t.history(period="5d", interval="1d")
-    if hist.empty:
-        return None
-    cur  = float(hist["Close"].iloc[-1])
-    prev = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else cur
-    chg      = cur - prev
-    chg_pct  = (chg / prev * 100) if prev else 0
-    return {"price": round(cur, 2), "change": round(chg, 2), "change_pct": round(chg_pct, 2)}
+DISPLAY_INDICES  = ["NIFTY 50", "NIFTY BANK", "NIFTY IT", "NIFTY PHARMA", "INDIA VIX"]
+DISPLAY_SECTORS  = ["NIFTY IT", "NIFTY BANK", "NIFTY PHARMA", "NIFTY AUTO",
+                    "NIFTY FMCG", "NIFTY METAL", "NIFTY REALTY",
+                    "NIFTY ENERGY", "NIFTY PSU BANK", "NIFTY MEDIA"]
+
+SECTOR_LABELS = {
+    "NIFTY IT":      "IT",
+    "NIFTY BANK":    "Bank",
+    "NIFTY PHARMA":  "Pharma",
+    "NIFTY AUTO":    "Auto",
+    "NIFTY FMCG":    "FMCG",
+    "NIFTY METAL":   "Metal",
+    "NIFTY REALTY":  "Realty",
+    "NIFTY ENERGY":  "Energy",
+    "NIFTY PSU BANK":"PSU Bank",
+    "NIFTY MEDIA":   "Media",
+}
 
 
-def _fetch_batch_history(symbols: list[str]):
-    """Download history for multiple symbols in one call — much more efficient."""
-    yf_syms = " ".join(symbols)
-    df = yf.download(yf_syms, period="5d", interval="1d",
-                     group_by="ticker", auto_adjust=True, progress=False)
-    results = {}
-    for sym in symbols:
-        try:
-            if len(symbols) == 1:
-                closes = df["Close"]
-            else:
-                closes = df[sym]["Close"]
-            closes = closes.dropna()
-            if len(closes) < 1:
-                continue
-            cur  = float(closes.iloc[-1])
-            prev = float(closes.iloc[-2]) if len(closes) >= 2 else cur
-            chg     = cur - prev
-            chg_pct = (chg / prev * 100) if prev else 0
-            results[sym] = {"price": round(cur, 2), "change": round(chg, 2), "change_pct": round(chg_pct, 2)}
-        except Exception:
-            continue
-    return results
+def _fetch_all_indices():
+    """Fetch all NSE indices in one call."""
+    data = nse_get("/api/allIndices")
+    # Response: {"data": [...], "timestamp": "..."}
+    rows = data.get("data", [])
+    result = {}
+    for row in rows:
+        name = row.get("index", "")
+        result[name] = {
+            "price":      round(float(row.get("last", 0) or 0), 2),
+            "change":     round(float(row.get("variation", 0) or 0), 2),
+            "change_pct": round(float(row.get("percentChange", 0) or 0), 2),
+        }
+    return result
 
 
-def _fetch_stock_info(yf_sym: str):
-    """Full stock info — uses info() only for individual stock pages."""
-    t = yf.Ticker(yf_sym)
-    info = t.info
-    hist = t.history(period="5d", interval="1d")
+def _fetch_nse_quote(symbol: str) -> dict:
+    """Get full stock quote from NSE."""
+    data = nse_get(f"/api/quote-equity?symbol={symbol}")
+    price_info  = data.get("priceInfo", {})
+    metadata    = data.get("metadata",  {})
+    industry    = data.get("industryInfo", {})
+    securities  = data.get("securityInfo", {})
 
-    cur = (info.get("regularMarketPrice") or info.get("currentPrice"))
-    if not cur and not hist.empty:
-        cur = float(hist["Close"].iloc[-1])
+    ltp         = price_info.get("lastPrice", 0)
+    prev_close  = price_info.get("previousClose", 0)
+    change      = price_info.get("change", 0)
+    change_pct  = price_info.get("pChange", 0)
+    week52      = price_info.get("weekHighLow", {})
 
-    prev = (info.get("regularMarketPreviousClose") or info.get("previousClose"))
-    if not prev and len(hist) >= 2:
-        prev = float(hist["Close"].iloc[-2])
-    elif not prev and not hist.empty:
-        prev = float(hist["Close"].iloc[-1])
-
-    if not cur:
-        raise ValueError(f"No price data for {yf_sym}")
-
-    def fmt(v):
-        try: return round(float(v), 2) if v is not None else None
+    def fn(v):
+        try: return round(float(v), 2) if v not in (None, "", "–", "-") else None
         except: return None
-    def fmt_int(v):
-        try: return int(v) if v is not None else None
-        except: return None
-
-    chg     = (cur - prev) if prev else 0
-    chg_pct = (chg / prev * 100) if prev else 0
 
     return {
-        "symbol":        yf_sym.replace(".NS", ""),
-        "name":          info.get("longName") or info.get("shortName") or yf_sym,
-        "price":         fmt(cur),
-        "change":        fmt(chg),
-        "change_pct":    fmt(chg_pct),
-        "open":          fmt(info.get("open") or info.get("regularMarketOpen")),
-        "high":          fmt(info.get("dayHigh") or info.get("regularMarketDayHigh")),
-        "low":           fmt(info.get("dayLow") or info.get("regularMarketDayLow")),
-        "prev_close":    fmt(prev),
-        "volume":        fmt_int(info.get("volume") or info.get("regularMarketVolume")),
-        "avg_volume":    fmt_int(info.get("averageVolume")),
-        "market_cap":    fmt_int(info.get("marketCap")),
-        "pe_ratio":      fmt(info.get("trailingPE")),
-        "pb_ratio":      fmt(info.get("priceToBook")),
-        "dividend_yield":fmt(info.get("dividendYield")),
-        "week_52_high":  fmt(info.get("fiftyTwoWeekHigh")),
-        "week_52_low":   fmt(info.get("fiftyTwoWeekLow")),
-        "sector":        info.get("sector") or "",
-        "industry":      info.get("industry") or "",
-        "description":   (info.get("longBusinessSummary") or "")[:600],
-        "eps":           fmt(info.get("trailingEps")),
-        "book_value":    fmt(info.get("bookValue")),
-        "debt_to_equity":fmt(info.get("debtToEquity")),
-        "roe":           fmt(info.get("returnOnEquity")),
-        "roa":           fmt(info.get("returnOnAssets")),
-        "employees":     fmt_int(info.get("fullTimeEmployees")),
-        "website":       info.get("website") or "",
-        "exchange":      "NSE",
-        "currency":      "INR",
+        "symbol":         symbol,
+        "name":           metadata.get("companyName", symbol),
+        "price":          fn(ltp),
+        "change":         fn(change),
+        "change_pct":     fn(change_pct),
+        "open":           fn(price_info.get("open")),
+        "high":           fn(price_info.get("intraDayHighLow", {}).get("max")),
+        "low":            fn(price_info.get("intraDayHighLow", {}).get("min")),
+        "prev_close":     fn(prev_close),
+        "volume":         None,   # not in this endpoint
+        "avg_volume":     None,
+        "market_cap":     None,   # NSE quote doesn't include mcap directly
+        "pe_ratio":       fn(metadata.get("pdSymbolPe")),
+        "pb_ratio":       None,
+        "dividend_yield": None,
+        "week_52_high":   fn(week52.get("max")),
+        "week_52_low":    fn(week52.get("min")),
+        "sector":         industry.get("macro", ""),
+        "industry":       industry.get("sector", ""),
+        "description":    "",
+        "eps":            None,
+        "book_value":     None,
+        "debt_to_equity": None,
+        "roe":            None,
+        "roa":            None,
+        "employees":      None,
+        "website":        "",
+        "exchange":       "NSE",
+        "currency":       "INR",
+        "isin":           securities.get("isin", ""),
+        "face_value":     fn(securities.get("faceVal")),
     }
 
 
-def _fetch_history(yf_sym: str, period: str, interval: str):
+def _fetch_history_yf(yf_sym: str, period: str, interval: str):
+    """Price history from yfinance — download endpoint is far less restricted."""
     t = yf.Ticker(yf_sym)
     return t.history(period=period, interval=interval)
 
@@ -171,21 +218,18 @@ async def get_indices():
         return cached
 
     loop = asyncio.get_event_loop()
-    symbols = list(INDICES.values())
-
     try:
-        batch = await loop.run_in_executor(executor, _fetch_batch_history, symbols)
-    except Exception:
-        batch = {}
+        all_idx = await loop.run_in_executor(executor, _fetch_all_indices)
+    except Exception as e:
+        raise HTTPException(502, f"NSE API error: {e}")
 
     result = []
-    for name, sym in INDICES.items():
-        d = batch.get(sym)
+    for name in DISPLAY_INDICES:
+        d = all_idx.get(name)
         if d:
-            result.append({"name": name, "symbol": sym, **d})
+            result.append({"name": name, "symbol": name, **d})
 
-    if result:
-        cache_set("indices", result, ttl=120)   # 2 min cache
+    cache_set("indices", result, ttl=90)
     return result
 
 
@@ -196,21 +240,22 @@ async def get_sectors():
         return cached
 
     loop = asyncio.get_event_loop()
-    symbols = list(SECTOR_INDICES.values())
-
     try:
-        batch = await loop.run_in_executor(executor, _fetch_batch_history, symbols)
-    except Exception:
-        batch = {}
+        all_idx = await loop.run_in_executor(executor, _fetch_all_indices)
+    except Exception as e:
+        raise HTTPException(502, f"NSE API error: {e}")
 
     result = []
-    for name, sym in SECTOR_INDICES.items():
-        d = batch.get(sym)
+    for nse_name in DISPLAY_SECTORS:
+        d = all_idx.get(nse_name)
         if d:
-            result.append({"name": name, "change_pct": d["change_pct"], "price": d["price"]})
+            result.append({
+                "name":       SECTOR_LABELS.get(nse_name, nse_name),
+                "change_pct": d["change_pct"],
+                "price":      d["price"],
+            })
 
-    if result:
-        cache_set("sectors", result, ttl=120)
+    cache_set("sectors", result, ttl=90)
     return result
 
 
@@ -228,18 +273,16 @@ async def search(q: str = Query(...)):
 
 @app.get("/api/stock/{symbol}")
 async def get_stock(symbol: str):
-    sym     = symbol.upper().strip()
-    yf_sym  = f"{sym}.NS"
+    sym       = symbol.upper().strip()
     cache_key = f"stock:{sym}"
-
-    cached = cache_get(cache_key)
+    cached    = cache_get(cache_key)
     if cached:
         return cached
 
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(executor, _fetch_stock_info, yf_sym)
-        cache_set(cache_key, data, ttl=60)   # 1 min cache per stock
+        data = await loop.run_in_executor(executor, _fetch_nse_quote, sym)
+        cache_set(cache_key, data, ttl=60)
         return data
     except Exception as e:
         raise HTTPException(500, f"Could not fetch {sym}: {str(e)}")
@@ -247,11 +290,10 @@ async def get_stock(symbol: str):
 
 @app.get("/api/stock/{symbol}/history")
 async def get_history(symbol: str, period: str = "1m"):
-    sym    = symbol.upper().strip()
-    yf_sym = f"{sym}.NS"
+    sym       = symbol.upper().strip()
+    yf_sym    = f"{sym}.NS"
     cache_key = f"hist:{sym}:{period}"
-
-    cached = cache_get(cache_key)
+    cached    = cache_get(cache_key)
     if cached:
         return cached
 
@@ -267,22 +309,23 @@ async def get_history(symbol: str, period: str = "1m"):
 
     loop = asyncio.get_event_loop()
     try:
-        hist = await loop.run_in_executor(executor, _fetch_history, yf_sym, yf_period, yf_interval)
+        hist = await loop.run_in_executor(
+            executor, _fetch_history_yf, yf_sym, yf_period, yf_interval
+        )
         if hist.empty:
             raise HTTPException(404, "No history data")
 
         result = [
             {
                 "time":   idx.isoformat(),
-                "open":   round(float(row["Open"]),   2),
-                "high":   round(float(row["High"]),   2),
-                "low":    round(float(row["Low"]),    2),
-                "close":  round(float(row["Close"]),  2),
+                "open":   round(float(row["Open"]),  2),
+                "high":   round(float(row["High"]),  2),
+                "low":    round(float(row["Low"]),   2),
+                "close":  round(float(row["Close"]), 2),
                 "volume": int(row["Volume"]),
             }
             for idx, row in hist.iterrows()
         ]
-        # cache history longer — it doesn't change frequently
         ttl = 300 if period in ("1m", "3m", "1y", "5y") else 60
         cache_set(cache_key, result, ttl=ttl)
         return result
