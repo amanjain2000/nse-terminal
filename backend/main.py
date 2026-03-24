@@ -244,7 +244,7 @@ def _fetch_shareholding(symbol: str) -> dict:
     """
     try:
         data = nse_get(
-            f"/api/shareholding-patterns?index=equities&symbol={symbol}"
+            f"/api/corporate-share-holdings-master?index=equities&symbol={symbol}"
         )
     except Exception as e:
         return {"history": [], "error": str(e)}
