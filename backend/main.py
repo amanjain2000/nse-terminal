@@ -93,7 +93,6 @@ def get_nse_session() -> httpx.Client:
 #         r.raise_for_status()
 #         return r.json()
 
-
 def nse_get(path: str) -> dict | list:
     import json
     import gzip
@@ -134,48 +133,7 @@ def nse_get(path: str) -> dict | list:
         client = get_nse_session()
         r = client.get(url, timeout=12)
         r.raise_for_status()
-        return _decode_content(r)def nse_get(path: str) -> dict | list:
-    import json
-    import gzip
-
-    client = get_nse_session()
-    url = NSE_BASE + path
-
-    def _decode_content(r):
-        content = r.content
-
-        encoding = r.headers.get("Content-Encoding", "").lower()
-
-        try:
-            if "br" in encoding:
-                import brotli
-                content = brotli.decompress(content)
-            elif "gzip" in encoding:
-                content = gzip.decompress(content)
-        except Exception:
-            # If decompression fails, continue with raw content
-            pass
-
-        try:
-            return json.loads(content.decode("utf-8", errors="ignore"))
-        except Exception:
-            raise Exception(f"Invalid NSE response: {content[:100]}")
-
-    try:
-        r = client.get(url, timeout=12)
-        r.raise_for_status()
         return _decode_content(r)
-
-    except Exception:
-        # Refresh session and retry once
-        global _nse_session_time
-        _nse_session_time = 0
-
-        client = get_nse_session()
-        r = client.get(url, timeout=12)
-        r.raise_for_status()
-        return _decode_content(r)
-
 
 # ── Index name map ───────────────────────────────────────────────────────────
 NSE_INDEX_NAMES = {
