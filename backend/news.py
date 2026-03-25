@@ -32,7 +32,8 @@ RSS_HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+# GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_API_URL = "https://api.groq.com/openai/v1"
 
 
 # ── RSS Fetching ──────────────────────────────────────────────────────────────
