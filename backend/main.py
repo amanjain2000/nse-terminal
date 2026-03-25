@@ -624,25 +624,31 @@ async def get_history(symbol: str, period: str = "1m"):
 # ── Phase 3: News & PESTEL routes ─────────────────────────────────────────────
 from news import fetch_news_for_symbol, compute_pestel_scores, get_macro_pestel
 
+def _get_api_key() -> str:
+    """Read Anthropic API key from environment variable."""
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
+
 @app.get("/api/stock/{symbol}/news")
-async def get_news(symbol: str):
+async def get_stock_news(symbol: str):
     sym = symbol.upper().strip()
     cached = cache_get(f"news:{sym}")
-    if cached: return cached
+    if cached:
+        return cached
 
-    # Get company name for relevance scoring
+    api_key      = _get_api_key()
     stock_cached = cache_get(f"stock:{sym}")
     company_name = stock_cached.get("name", sym) if stock_cached else sym
 
     loop = asyncio.get_event_loop()
     try:
-        news = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             executor,
-            lambda: fetch_news_for_symbol(sym, company_name)
+            lambda: fetch_news_for_symbol(sym, company_name, api_key)
         )
-        pestel = compute_pestel_scores(news)
-        result = {"news": news, "pestel": pestel, "symbol": sym}
-        cache_set(f"news:{sym}", result, ttl=600)  # 10 min cache
+        result["symbol"]     = sym
+        result["llm_enabled"] = bool(api_key)
+        cache_set(f"news:{sym}", result, ttl=600)   # 10 min
         return result
     except Exception as e:
         raise HTTPException(500, f"News error for {sym}: {e}")
@@ -651,11 +657,17 @@ async def get_news(symbol: str):
 @app.get("/api/macro/pestel")
 async def get_macro():
     cached = cache_get("macro_pestel")
-    if cached: return cached
-    loop = asyncio.get_event_loop()
+    if cached:
+        return cached
+
+    api_key = _get_api_key()
+    loop    = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(executor, get_macro_pestel)
-        cache_set("macro_pestel", result, ttl=1800)  # 30 min cache
+        result = await loop.run_in_executor(
+            executor,
+            lambda: get_macro_pestel(api_key)
+        )
+        cache_set("macro_pestel", result, ttl=1800)  # 30 min
         return result
     except Exception as e:
         raise HTTPException(500, f"Macro PESTEL error: {e}")
