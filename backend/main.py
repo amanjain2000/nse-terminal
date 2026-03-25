@@ -626,7 +626,7 @@ from news import fetch_news_for_symbol, compute_pestel_scores, get_macro_pestel
 
 def _get_api_key() -> str:
     """Read Anthropic API key from environment variable."""
-    return os.environ.get("ANTHROPIC_API_KEY", "")
+    return os.environ.get("GROQ_API_KEY", "")
 
 
 @app.get("/api/stock/{symbol}/news")
