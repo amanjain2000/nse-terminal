@@ -1,34 +1,30 @@
 """
-News ingestion + PESTEL scoring engine.
-Sources: free RSS feeds — no API keys needed.
+News ingestion + LLM-powered PESTEL & sentiment analysis.
+RSS fetching is free. Analysis uses Claude via Anthropic API.
 """
 import httpx
 import time
 import re
+import json
+import os
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from datetime import datetime
 
 # ── RSS Sources ───────────────────────────────────────────────────────────────
 RSS_FEEDS = [
-    # Economic Times
-    {"name": "Economic Times — Markets",  "url": "https://economictimes.indiatimes.com/markets/rss.cms"},
-    {"name": "Economic Times — Stocks",   "url": "https://economictimes.indiatimes.com/markets/stocks/rss.cms"},
-    {"name": "Economic Times — Economy",  "url": "https://economictimes.indiatimes.com/news/economy/rss.cms"},
-    {"name": "Economic Times — Finance",  "url": "https://economictimes.indiatimes.com/news/company/corporate-news/rss.cms"},
-    # Business Standard
-    {"name": "Business Standard — Markets", "url": "https://www.business-standard.com/rss/markets-106.rss"},
-    {"name": "Business Standard — Economy", "url": "https://www.business-standard.com/rss/economy-102.rss"},
+    {"name": "Economic Times — Markets",   "url": "https://economictimes.indiatimes.com/markets/rss.cms"},
+    {"name": "Economic Times — Stocks",    "url": "https://economictimes.indiatimes.com/markets/stocks/rss.cms"},
+    {"name": "Economic Times — Economy",   "url": "https://economictimes.indiatimes.com/news/economy/rss.cms"},
+    {"name": "Economic Times — Corporate", "url": "https://economictimes.indiatimes.com/news/company/corporate-news/rss.cms"},
+    {"name": "Business Standard — Markets","url": "https://www.business-standard.com/rss/markets-106.rss"},
+    {"name": "Business Standard — Economy","url": "https://www.business-standard.com/rss/economy-102.rss"},
     {"name": "Business Standard — Companies","url": "https://www.business-standard.com/rss/companies-101.rss"},
-    # Moneycontrol
-    {"name": "Moneycontrol — News",       "url": "https://www.moneycontrol.com/rss/latestnews.xml"},
-    {"name": "Moneycontrol — Markets",    "url": "https://www.moneycontrol.com/rss/marketreports.xml"},
-    # Hindu Business Line
-    {"name": "BusinessLine — Markets",    "url": "https://www.thehindubusinessline.com/markets/?service=rss"},
-    {"name": "BusinessLine — Economy",    "url": "https://www.thehindubusinessline.com/economy/?service=rss"},
-    # Mint
-    {"name": "Mint — Markets",            "url": "https://www.livemint.com/rss/markets"},
-    {"name": "Mint — Companies",          "url": "https://www.livemint.com/rss/companies"},
+    {"name": "Moneycontrol — News",        "url": "https://www.moneycontrol.com/rss/latestnews.xml"},
+    {"name": "Moneycontrol — Markets",     "url": "https://www.moneycontrol.com/rss/marketreports.xml"},
+    {"name": "BusinessLine — Markets",     "url": "https://www.thehindubusinessline.com/markets/?service=rss"},
+    {"name": "BusinessLine — Economy",     "url": "https://www.thehindubusinessline.com/economy/?service=rss"},
+    {"name": "Mint — Markets",             "url": "https://www.livemint.com/rss/markets"},
+    {"name": "Mint — Companies",           "url": "https://www.livemint.com/rss/companies"},
 ]
 
 RSS_HEADERS = {
@@ -36,122 +32,12 @@ RSS_HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
-# ── PESTEL keyword maps ───────────────────────────────────────────────────────
-# Each category has weighted keywords. Higher weight = stronger signal.
-PESTEL_KEYWORDS = {
-    "Political": {
-        "high": [
-            "government policy", "rbi policy", "sebi", "ministry", "cabinet", "parliament",
-            "budget", "union budget", "election", "regulation", "regulatory", "government ban",
-            "fdi policy", "import duty", "export ban", "geopolitical", "sanctions",
-            "tax policy", "gst", "disinvestment", "privatisation", "nationalization",
-        ],
-        "medium": [
-            "government", "policy", "minister", "political", "regulatory",
-            "compliance", "nda", "opposition", "legislation", "bill passed",
-        ],
-        "low": ["pm modi", "finance minister", "bjp", "congress", "state government"],
-    },
-    "Economic": {
-        "high": [
-            "gdp", "inflation", "cpi", "wpi", "repo rate", "interest rate", "rbi rate",
-            "monetary policy", "mpc", "credit policy", "economic growth", "recession",
-            "trade deficit", "current account", "forex reserves", "rupee", "usd inr",
-            "iip", "pmi", "employment", "unemployment", "fiscal deficit", "tax revenue",
-        ],
-        "medium": [
-            "economy", "economic", "growth", "market cap", "revenue", "profit", "earnings",
-            "quarterly results", "fy25", "fy26", "annual results", "ebitda", "margin",
-            "capex", "debt", "credit rating", "downgrade", "upgrade",
-        ],
-        "low": ["sales", "order book", "contract", "deal", "acquisition", "merger"],
-    },
-    "Social": {
-        "high": [
-            "consumer demand", "consumer sentiment", "rural demand", "urban demand",
-            "demographic", "labour law", "employment generation", "wage", "social media",
-            "brand reputation", "boycott", "consumer protection", "public health",
-            "pandemic", "epidemic", "health crisis",
-        ],
-        "medium": [
-            "consumer", "customer", "workforce", "employee", "hiring", "layoff",
-            "social", "community", "csr", "esg", "gender", "diversity",
-        ],
-        "low": ["brand", "reputation", "marketing", "advertisement", "campaign"],
-    },
-    "Technological": {
-        "high": [
-            "artificial intelligence", "ai", "machine learning", "automation",
-            "digital transformation", "technology", "innovation", "patent", "r&d",
-            "semiconductor", "chip", "ev", "electric vehicle", "renewable energy",
-            "blockchain", "cloud computing", "cybersecurity", "data breach",
-            "5g", "iot", "robotics", "biotech", "pharma r&d",
-        ],
-        "medium": [
-            "tech", "software", "platform", "digital", "online", "app", "startup",
-            "investment in tech", "it spending", "digital india",
-        ],
-        "low": ["upgrade", "new product", "launch", "update"],
-    },
-    "Environmental": {
-        "high": [
-            "climate change", "carbon emission", "net zero", "carbon neutral",
-            "esg", "sustainability", "renewable", "solar", "wind energy",
-            "pollution", "environmental compliance", "green", "paris agreement",
-            "deforestation", "water scarcity", "drought", "flood",
-            "carbon credit", "emission trading",
-        ],
-        "medium": [
-            "environment", "environmental", "green energy", "clean energy",
-            "waste management", "recycling", "sustainable", "eco-friendly",
-        ],
-        "low": ["natural disaster", "monsoon", "weather", "climate"],
-    },
-    "Legal": {
-        "high": [
-            "court order", "supreme court", "high court", "tribunal", "nclt",
-            "litigation", "lawsuit", "legal challenge", "sebi order", "rbi action",
-            "penalty", "fine", "enforcement", "investigation", "cbi", "ed",
-            "insolvency", "bankruptcy", "ibc", "arbitration", "fraud",
-        ],
-        "medium": [
-            "legal", "regulatory action", "compliance", "violation", "notice",
-            "show cause", "inquiry", "audit", "governance", "board meeting",
-        ],
-        "low": ["contract dispute", "ip", "patent dispute", "trademark"],
-    },
-}
-
-# Sentiment keywords
-POSITIVE_WORDS = {
-    "surge", "rally", "gain", "rise", "jump", "soar", "hit high", "record high",
-    "strong", "beat", "outperform", "upgrade", "positive", "growth", "profit",
-    "win", "approval", "breakthrough", "expansion", "order win", "new contract",
-    "acquisition", "good", "bullish", "buy", "upside", "robust", "milestone",
-}
-NEGATIVE_WORDS = {
-    "fall", "drop", "decline", "crash", "plunge", "sink", "hit low", "record low",
-    "weak", "miss", "underperform", "downgrade", "negative", "loss", "penalty",
-    "reject", "ban", "delay", "risk", "concern", "sell", "downside", "bearish",
-    "fraud", "probe", "investigation", "fine", "crisis", "warning", "cut",
-}
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 
 
-@dataclass
-class NewsItem:
-    title: str
-    summary: str
-    url: str
-    source: str
-    published: str
-    pestel_categories: list = field(default_factory=list)
-    sentiment: str = "neutral"   # positive / negative / neutral
-    sentiment_score: float = 0.0  # -1 to +1
-    relevance_score: float = 0.0
-
+# ── RSS Fetching ──────────────────────────────────────────────────────────────
 
 def _fetch_rss(feed: dict, timeout: int = 8) -> list[dict]:
-    """Fetch and parse one RSS feed. Returns list of raw items."""
     try:
         r = httpx.get(feed["url"], headers=RSS_HEADERS, timeout=timeout, follow_redirects=True)
         if r.status_code != 200:
@@ -160,207 +46,302 @@ def _fetch_rss(feed: dict, timeout: int = 8) -> list[dict]:
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         items = []
 
-        # RSS 2.0
         for item in root.findall(".//item"):
             title   = (item.findtext("title") or "").strip()
-            desc    = (item.findtext("description") or "").strip()
+            desc    = re.sub(r"<[^>]+>", " ", item.findtext("description") or "").strip()
+            desc    = re.sub(r"\s+", " ", desc)[:350]
             link    = (item.findtext("link") or "").strip()
             pub     = (item.findtext("pubDate") or "").strip()
-            # Clean HTML from description
-            desc = re.sub(r"<[^>]+>", " ", desc).strip()
-            desc = re.sub(r"\s+", " ", desc)[:400]
-            items.append({"title": title, "summary": desc, "url": link,
-                          "source": feed["name"], "published": pub})
+            if title:
+                items.append({"title": title, "summary": desc, "url": link,
+                              "source": feed["name"], "published": pub})
 
-        # Atom feed fallback
         if not items:
             for entry in root.findall("atom:entry", ns):
                 title   = (entry.findtext("atom:title", namespaces=ns) or "").strip()
-                summary = (entry.findtext("atom:summary", namespaces=ns) or "").strip()
-                link_el  = entry.find("atom:link", ns)
+                summary = re.sub(r"<[^>]+>", " ",
+                                 entry.findtext("atom:summary", namespaces=ns) or "").strip()[:350]
+                link_el = entry.find("atom:link", ns)
                 link    = link_el.get("href", "") if link_el is not None else ""
                 pub     = (entry.findtext("atom:published", namespaces=ns) or "").strip()
-                summary = re.sub(r"<[^>]+>", " ", summary).strip()[:400]
-                items.append({"title": title, "summary": summary, "url": link,
-                              "source": feed["name"], "published": pub})
-
+                if title:
+                    items.append({"title": title, "summary": summary, "url": link,
+                                  "source": feed["name"], "published": pub})
         return items
     except Exception:
         return []
 
 
-def _score_pestel(text: str) -> list[str]:
-    """Return list of PESTEL categories triggered by the text."""
-    text_lower = text.lower()
-    triggered = []
-    for category, weights in PESTEL_KEYWORDS.items():
-        score = 0
-        for kw in weights.get("high", []):
-            if kw in text_lower:
-                score += 3
-        for kw in weights.get("medium", []):
-            if kw in text_lower:
-                score += 1.5
-        for kw in weights.get("low", []):
-            if kw in text_lower:
-                score += 0.5
-        if score >= 1.5:
-            triggered.append(category)
-    return triggered
-
-
-def _score_sentiment(text: str) -> tuple[str, float]:
-    """Return (label, score) where score is -1 to +1."""
-    text_lower = text.lower()
-    pos = sum(1 for w in POSITIVE_WORDS if w in text_lower)
-    neg = sum(1 for w in NEGATIVE_WORDS if w in text_lower)
-    total = pos + neg
-    if total == 0:
-        return "neutral", 0.0
-    score = (pos - neg) / total
-    if score > 0.2:
-        return "positive", round(score, 2)
-    elif score < -0.2:
-        return "negative", round(score, 2)
-    return "neutral", round(score, 2)
-
-
-def _relevance(item: dict, symbol: str, company_name: str) -> float:
-    """Score 0–10 how relevant a news item is to the given stock."""
-    text = (item["title"] + " " + item["summary"]).lower()
-    sym_lower  = symbol.lower()
-    name_lower = company_name.lower()
+def _relevance_prefilter(item: dict, symbol: str, company_name: str) -> float:
+    """
+    Fast pre-filter before sending to LLM — avoids wasting API calls on
+    clearly irrelevant news. Returns 0.0 (skip) or a rough relevance 1–10.
+    """
+    text      = (item["title"] + " " + item["summary"]).lower()
+    sym_lower = symbol.lower()
+    # Extract meaningful name words (skip generic words)
+    stop = {"limited", "india", "ltd", "company", "corp", "private", "pvt",
+            "industries", "enterprises", "group", "holdings", "services"}
+    name_words = [w for w in company_name.lower().split()
+                  if len(w) > 3 and w not in stop]
 
     score = 0.0
-    # Exact symbol match in title = very strong
     if sym_lower in item["title"].lower():
-        score += 6
+        score += 7
     elif sym_lower in text:
         score += 3
-
-    # Company name words in title/text
-    name_words = [w for w in name_lower.split() if len(w) > 3
-                  and w not in ("limited", "india", "ltd", "company", "corp")]
     for w in name_words:
         if w in item["title"].lower():
-            score += 2
+            score += 3
         elif w in text:
-            score += 0.5
-
+            score += 1
     return min(score, 10.0)
 
+
+# ── LLM Analysis ─────────────────────────────────────────────────────────────
+
+ANALYSIS_SYSTEM_PROMPT = """You are a financial news analyst specializing in Indian equity markets.
+You will receive a batch of news articles related to a specific NSE-listed stock.
+For each article, you must analyze and return structured JSON.
+
+PESTEL categories (choose ALL that apply, can be empty list):
+- Political: government policy, regulation, SEBI/RBI directives, elections, trade policy, FDI rules
+- Economic: GDP, inflation, interest rates, earnings, revenue, profit, macroeconomic indicators, RBI rates, forex
+- Social: consumer behavior, workforce, demographics, ESG, brand reputation, public opinion, health trends
+- Technological: AI, automation, R&D, patents, digital transformation, new products, IT, semiconductor
+- Environmental: climate, sustainability, pollution, carbon emissions, green energy, natural disasters, ESG
+- Legal: court orders, NCLT, SEBI/ED actions, penalties, litigation, compliance violations, fraud
+
+Sentiment:
+- positive: clearly good for the stock/company (profit growth, order wins, upgrades, strong results)
+- negative: clearly bad (losses, penalties, downgrades, fraud, weak results, regulatory action)
+- neutral: factual/balanced or unclear market impact
+
+sentiment_score: float from -1.0 (very negative) to +1.0 (very positive), 0.0 = neutral
+
+reasoning: 1 sentence explaining why you chose these categories and sentiment.
+
+Return ONLY a JSON array, no markdown, no explanation outside the array:
+[
+  {
+    "index": 0,
+    "pestel_categories": ["Economic", "Political"],
+    "sentiment": "positive",
+    "sentiment_score": 0.6,
+    "reasoning": "RBI rate cut reduces borrowing costs, boosting profitability outlook."
+  },
+  ...
+]"""
+
+
+def _analyze_batch_llm(articles: list[dict], symbol: str, api_key: str) -> list[dict]:
+    """
+    Send a batch of articles to Claude for PESTEL + sentiment analysis.
+    Returns list of analysis results matching the input indices.
+    """
+    if not articles:
+        return []
+
+    # Build the user message
+    articles_text = ""
+    for i, art in enumerate(articles):
+        articles_text += f"\n[{i}] SOURCE: {art['source']}\nTITLE: {art['title']}\nSUMMARY: {art['summary']}\n"
+
+    user_msg = (
+        f"Analyze these {len(articles)} news articles about {symbol} (NSE-listed Indian stock).\n"
+        f"Return a JSON array with one object per article.\n\n"
+        f"{articles_text}"
+    )
+
+    headers = {
+        "x-api-key":         api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type":      "application/json",
+    }
+    body = {
+        "model":      "claude-sonnet-4-20250514",
+        "max_tokens": 2000,
+        "system":     ANALYSIS_SYSTEM_PROMPT,
+        "messages":   [{"role": "user", "content": user_msg}],
+    }
+
+    try:
+        r = httpx.post(ANTHROPIC_API_URL, headers=headers, json=body, timeout=30)
+        r.raise_for_status()
+        resp = r.json()
+        text = resp["content"][0]["text"].strip()
+
+        # Strip markdown fences if present
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+
+        results = json.loads(text)
+        if isinstance(results, list):
+            return results
+    except Exception:
+        pass
+
+    # Fallback: return neutral analysis for all articles
+    return [{"index": i, "pestel_categories": [], "sentiment": "neutral",
+             "sentiment_score": 0.0, "reasoning": "Analysis unavailable."}
+            for i in range(len(articles))]
+
+
+def _analyze_all_articles(articles: list[dict], symbol: str, api_key: str,
+                          batch_size: int = 10) -> list[dict]:
+    """
+    Process all articles through LLM in batches of `batch_size`.
+    Merges LLM results back into the article dicts.
+    """
+    annotated = []
+    for start in range(0, len(articles), batch_size):
+        batch = articles[start: start + batch_size]
+        llm_results = _analyze_batch_llm(batch, symbol, api_key)
+
+        # Build a lookup by index
+        llm_by_idx = {r.get("index", i): r for i, r in enumerate(llm_results)}
+
+        for j, art in enumerate(batch):
+            llm = llm_by_idx.get(j, {})
+            annotated.append({
+                **art,
+                "pestel_categories": llm.get("pestel_categories", []),
+                "sentiment":         llm.get("sentiment", "neutral"),
+                "sentiment_score":   float(llm.get("sentiment_score", 0.0)),
+                "reasoning":         llm.get("reasoning", ""),
+            })
+
+        # Small delay between batches to be kind to the API
+        if start + batch_size < len(articles):
+            time.sleep(0.3)
+
+    return annotated
+
+
+# ── Main entry points ─────────────────────────────────────────────────────────
 
 def fetch_news_for_symbol(
     symbol: str,
     company_name: str,
+    api_key: str,
     max_items: int = 30,
     min_relevance: float = 1.0,
-) -> list[dict]:
+) -> dict:
     """
-    Fetch news from all RSS feeds, filter/rank by relevance to symbol,
-    annotate with PESTEL categories and sentiment.
-    Returns top `max_items` results sorted by relevance then recency.
+    1. Fetch all RSS feeds in parallel (no API key needed)
+    2. Pre-filter by relevance to the symbol
+    3. Send relevant articles to Claude for PESTEL + sentiment
+    4. Compute aggregate PESTEL scores
+    Returns: {"news": [...], "pestel": {...}}
     """
+    # Step 1: Fetch all feeds
     all_raw = []
     for feed in RSS_FEEDS:
         items = _fetch_rss(feed, timeout=6)
         all_raw.extend(items)
-        time.sleep(0.05)
+        time.sleep(0.03)
 
     # Deduplicate by URL
-    seen_urls = set()
+    seen_urls: set = set()
     unique = []
     for item in all_raw:
-        if item["url"] and item["url"] not in seen_urls:
-            seen_urls.add(item["url"])
+        url = item.get("url", "")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique.append(item)
+        elif not url:
             unique.append(item)
 
-    # Score each item
-    annotated = []
+    # Step 2: Pre-filter by relevance
+    with_relevance = []
     for item in unique:
-        rel = _relevance(item, symbol, company_name)
-        if rel < min_relevance:
-            continue
-        text = item["title"] + " " + item["summary"]
-        pestel = _score_pestel(text)
-        sentiment, score = _score_sentiment(text)
-        annotated.append({
-            "title":             item["title"],
-            "summary":           item["summary"][:300],
-            "url":               item["url"],
-            "source":            item["source"],
-            "published":         item["published"],
-            "pestel_categories": pestel,
-            "sentiment":         sentiment,
-            "sentiment_score":   score,
-            "relevance_score":   rel,
-        })
+        rel = _relevance_prefilter(item, symbol, company_name)
+        if rel >= min_relevance:
+            with_relevance.append({**item, "relevance_score": rel})
 
-    # Sort: relevance desc, then recency (we don't parse dates to keep it simple)
-    annotated.sort(key=lambda x: x["relevance_score"], reverse=True)
-    return annotated[:max_items]
+    # Sort by relevance, take top candidates for LLM
+    with_relevance.sort(key=lambda x: x["relevance_score"], reverse=True)
+    candidates = with_relevance[:max_items]
+
+    # Step 3: LLM analysis
+    if api_key and candidates:
+        annotated = _analyze_all_articles(candidates, symbol, api_key)
+    else:
+        # No API key — return articles without PESTEL analysis
+        annotated = [{**art, "pestel_categories": [], "sentiment": "neutral",
+                      "sentiment_score": 0.0, "reasoning": ""}
+                     for art in candidates]
+
+    # Step 4: Compute aggregate PESTEL scores
+    pestel_scores = compute_pestel_scores(annotated)
+
+    return {"news": annotated, "pestel": pestel_scores}
 
 
 def compute_pestel_scores(news_items: list[dict]) -> dict:
     """
-    Aggregate PESTEL signal scores from news items.
-    Returns dict with each category's score (0–100) and sentiment breakdown.
+    Aggregate PESTEL signals from LLM-annotated news items.
+    Returns a dict with per-category scores, counts, and bullish/bearish signal.
     """
-    categories = list(PESTEL_KEYWORDS.keys())
-    scores = {c: {"count": 0, "positive": 0, "negative": 0, "neutral": 0, "score": 0} for c in categories}
+    categories = ["Political", "Economic", "Social", "Technological", "Environmental", "Legal"]
+    scores = {c: {"count": 0, "positive": 0, "negative": 0, "neutral": 0,
+                  "score_sum": 0.0, "articles": []} for c in categories}
 
     for item in news_items:
-        weight = max(item.get("relevance_score", 1), 1)
+        rel_weight = max(item.get("relevance_score", 1.0), 1.0)
         for cat in item.get("pestel_categories", []):
-            if cat in scores:
-                scores[cat]["count"] += 1
-                s = item.get("sentiment", "neutral")
-                scores[cat][s] += weight
-                # Score: positive sentiment → green, negative → red
-                sent_score = item.get("sentiment_score", 0)
-                scores[cat]["score"] += sent_score * weight
+            if cat not in scores:
+                continue
+            scores[cat]["count"] += 1
+            sent = item.get("sentiment", "neutral")
+            scores[cat][sent] = scores[cat].get(sent, 0) + 1
+            scores[cat]["score_sum"] += item.get("sentiment_score", 0.0) * rel_weight
+            # Keep top 3 article titles per category for display
+            if len(scores[cat]["articles"]) < 3:
+                scores[cat]["articles"].append({
+                    "title":     item.get("title", ""),
+                    "sentiment": sent,
+                    "reasoning": item.get("reasoning", ""),
+                })
 
-    # Normalize scores to 0–100 (50 = neutral)
     for cat in categories:
         d = scores[cat]
-        total_weight = d["positive"] + d["negative"] + d["neutral"]
-        if total_weight > 0:
-            raw = d["score"] / total_weight
-            d["normalized"] = round(50 + raw * 50, 1)
-        else:
-            d["normalized"] = 50.0
+        total_weight = max(d["count"], 1)
+        raw_score    = d["score_sum"] / total_weight
+        # Normalize to 0–100 (50 = neutral baseline)
+        d["normalized"] = round(50 + raw_score * 50, 1)
         d["signal"] = (
             "bullish" if d["normalized"] > 60
             else "bearish" if d["normalized"] < 40
             else "neutral"
         )
+        del d["score_sum"]  # Don't expose raw intermediate
 
     return scores
 
 
-def get_macro_pestel() -> dict:
+def get_macro_pestel(api_key: str) -> dict:
     """
-    Macro-level PESTEL — fetch market-wide news and score.
-    Used for the overall market overview.
+    Market-wide PESTEL from general market news (no stock filter).
     """
     all_raw = []
-    for feed in RSS_FEEDS[:6]:  # use first 6 feeds for macro
+    for feed in RSS_FEEDS[:8]:
         items = _fetch_rss(feed, timeout=5)
-        all_raw.extend(items[:10])
-        time.sleep(0.05)
+        all_raw.extend(items[:8])
+        time.sleep(0.03)
 
-    macro_items = []
-    for item in all_raw[:60]:
-        text = item["title"] + " " + item["summary"]
-        pestel = _score_pestel(text)
-        sentiment, score = _score_sentiment(text)
-        if pestel:
-            macro_items.append({
-                **item,
-                "pestel_categories": pestel,
-                "sentiment": sentiment,
-                "sentiment_score": score,
-                "relevance_score": 3.0,
-            })
+    # Take top 30 macro items
+    candidates = [
+        {**item, "relevance_score": 3.0}
+        for item in all_raw[:30]
+        if item.get("title")
+    ]
 
-    return compute_pestel_scores(macro_items)
+    if api_key and candidates:
+        annotated = _analyze_all_articles(candidates, "MACRO", api_key, batch_size=15)
+    else:
+        annotated = [{**art, "pestel_categories": [], "sentiment": "neutral",
+                      "sentiment_score": 0.0, "reasoning": ""}
+                     for art in candidates]
+
+    return compute_pestel_scores(annotated)
