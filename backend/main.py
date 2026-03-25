@@ -5,7 +5,8 @@ import asyncio
 import time
 import json
 import gzip
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor
 from stocks_list import NSE_STOCKS
 
@@ -27,44 +28,45 @@ def cache_set(key, val, ttl):
 
 # ── NSE Session ───────────────────────────────────────────────────────────────
 NSE_BASE = "https://www.nseindia.com"
+NSE_API  = "https://www.nseindia.com/api"
+
 NSE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
+    "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.nseindia.com/",
+    "Referer":         "https://www.nseindia.com/",
     "X-Requested-With": "XMLHttpRequest",
     "DNT": "1",
     "Connection": "keep-alive",
 }
 
-_nse_client: httpx.Client | None = None
-_nse_client_ts: float = 0
-SESSION_TTL = 240   # 4 min — refresh before NSE kills idle sessions
+_client: httpx.Client | None = None
+_client_ts: float = 0
+SESSION_TTL = 200  # refresh every ~3 min
 
-def _make_client() -> httpx.Client:
-    client = httpx.Client(headers=NSE_HEADERS, follow_redirects=True, timeout=20)
-    # Warm up: hit main page to get cookies, then the market-status page
-    for warm_url in ["/", "/market-data/live-equity-market"]:
+def _build_client() -> httpx.Client:
+    c = httpx.Client(headers=NSE_HEADERS, follow_redirects=True, timeout=20)
+    for url in ["/", "/market-data/live-equity-market", "/get-quotes/equity?symbol=RELIANCE"]:
         try:
-            client.get(NSE_BASE + warm_url, timeout=10)
-            time.sleep(0.4)
+            c.get(NSE_BASE + url, timeout=10)
+            time.sleep(0.5)
         except:
             pass
-    return client
+    return c
 
 def get_client() -> httpx.Client:
-    global _nse_client, _nse_client_ts
-    if _nse_client and time.time() - _nse_client_ts < SESSION_TTL:
-        return _nse_client
-    if _nse_client:
-        try: _nse_client.close()
+    global _client, _client_ts
+    if _client and time.time() - _client_ts < SESSION_TTL:
+        return _client
+    if _client:
+        try: _client.close()
         except: pass
-    _nse_client = _make_client()
-    _nse_client_ts = time.time()
-    return _nse_client
+    _client = _build_client()
+    _client_ts = time.time()
+    return _client
 
-def _decode(r: httpx.Response):
+def _decode(r: httpx.Response) -> dict | list:
     content = r.content
     enc = r.headers.get("Content-Encoding", "").lower()
     try:
@@ -77,23 +79,22 @@ def _decode(r: httpx.Response):
         pass
     text = content.decode("utf-8", errors="replace").strip()
     if not text:
-        raise ValueError(f"Empty response from NSE (status {r.status_code})")
+        raise ValueError(f"Empty NSE response (HTTP {r.status_code})")
     return json.loads(text)
 
-def nse_get(path: str, retry: bool = True):
+def nse_get(path: str, params: dict | None = None, base: str = NSE_API) -> dict | list:
     client = get_client()
+    url = base + path
     try:
-        r = client.get(NSE_BASE + path, timeout=15)
+        r = client.get(url, params=params, timeout=15)
         r.raise_for_status()
         return _decode(r)
-    except Exception as e:
-        if not retry:
-            raise
-        # Session expired — rebuild and retry once
-        global _nse_client_ts
-        _nse_client_ts = 0
+    except Exception:
+        # Rebuild session once and retry
+        global _client_ts
+        _client_ts = 0
         client = get_client()
-        r = client.get(NSE_BASE + path, timeout=15)
+        r = client.get(url, params=params, timeout=15)
         r.raise_for_status()
         return _decode(r)
 
@@ -102,15 +103,13 @@ def fn(v):
     try:
         if v in (None, "", "–", "-", "--", "NA", "N/A"): return None
         return round(float(str(v).replace(",", "")), 2)
-    except:
-        return None
+    except: return None
 
 def fn_int(v):
     try:
         if v in (None, "", "–", "-", "--", "NA", "N/A"): return None
         return int(float(str(v).replace(",", "")))
-    except:
-        return None
+    except: return None
 
 # ── Index maps ────────────────────────────────────────────────────────────────
 DISPLAY_INDICES = ["NIFTY 50", "NIFTY BANK", "NIFTY IT", "NIFTY PHARMA", "INDIA VIX"]
@@ -124,62 +123,58 @@ SECTOR_LABELS = {
     "NIFTY PSU BANK": "PSU Bank", "NIFTY MEDIA": "Media",
 }
 
-# ── Data fetchers ─────────────────────────────────────────────────────────────
-def _fetch_all_indices():
-    data = nse_get("/api/allIndices")
-    rows = data.get("data", [])
-    result = {}
-    for row in rows:
-        name = row.get("index", "")
-        result[name] = {
+# ── Fetchers ──────────────────────────────────────────────────────────────────
+
+def _fetch_all_indices() -> dict:
+    data = nse_get("/allIndices")
+    return {
+        row.get("index", ""): {
             "price":      round(float(row.get("last", 0) or 0), 2),
             "change":     round(float(row.get("variation", 0) or 0), 2),
             "change_pct": round(float(row.get("percentChange", 0) or 0), 2),
         }
-    return result
+        for row in data.get("data", [])
+    }
 
 
-def _fetch_nse_quote(symbol: str) -> dict:
-    data = nse_get(f"/api/quote-equity?symbol={symbol}")
+def _fetch_quote(symbol: str) -> dict:
+    data       = nse_get("/quote-equity", {"symbol": symbol})
+    trade_data = {}
     try:
-        trade_data = nse_get(f"/api/quote-equity?symbol={symbol}&section=trade_info")
-    except:
-        trade_data = {}
+        trade_data = nse_get("/quote-equity", {"symbol": symbol, "section": "trade_info"})
+    except: pass
 
-    price_info  = data.get("priceInfo", {})
-    metadata    = data.get("metadata", {})
-    industry    = data.get("industryInfo", {})
-    securities  = data.get("securityInfo", {})
-    trade_sum   = trade_data.get("securityWiseDP", {})
-
-    week52 = price_info.get("weekHighLow", {})
+    pi = data.get("priceInfo", {})
+    md = data.get("metadata", {})
+    ind = data.get("industryInfo", {})
+    sec = data.get("securityInfo", {})
+    td = trade_data.get("securityWiseDP", {})
+    w52 = pi.get("weekHighLow", {})
 
     return {
-        "symbol":       symbol,
-        "name":         metadata.get("companyName", symbol),
-        "price":        fn(price_info.get("lastPrice")),
-        "change":       fn(price_info.get("change")),
-        "change_pct":   fn(price_info.get("pChange")),
-        "open":         fn(price_info.get("open")),
-        "high":         fn(price_info.get("intraDayHighLow", {}).get("max")),
-        "low":          fn(price_info.get("intraDayHighLow", {}).get("min")),
-        "prev_close":   fn(price_info.get("previousClose")),
-        "vwap":         fn(price_info.get("vwap")),
-        "volume":       fn_int(trade_sum.get("quantityTraded")),
-        "delivery_qty": fn_int(trade_sum.get("deliveryQuantity")),
-        "delivery_pct": fn(trade_sum.get("deliveryToTradedQuantity")),
-        "market_cap":   fn_int(metadata.get("totalMarketCap") or metadata.get("ffmc")),
-        "pe_ratio":     fn(metadata.get("pdSymbolPe")),
-        "week_52_high": fn(week52.get("max")),
-        "week_52_low":  fn(week52.get("min")),
-        "sector":       industry.get("macro", ""),
-        "industry":     industry.get("sector", ""),
-        "isin":         securities.get("isin", ""),
-        "face_value":   fn(securities.get("faceVal")),
-        "series":       metadata.get("series", "EQ"),
-        "exchange":     "NSE",
-        "currency":     "INR",
-        # placeholders — not in NSE quote
+        "symbol":        symbol,
+        "name":          md.get("companyName", symbol),
+        "price":         fn(pi.get("lastPrice")),
+        "change":        fn(pi.get("change")),
+        "change_pct":    fn(pi.get("pChange")),
+        "open":          fn(pi.get("open")),
+        "high":          fn(pi.get("intraDayHighLow", {}).get("max")),
+        "low":           fn(pi.get("intraDayHighLow", {}).get("min")),
+        "prev_close":    fn(pi.get("previousClose")),
+        "vwap":          fn(pi.get("vwap")),
+        "volume":        fn_int(td.get("quantityTraded")),
+        "delivery_qty":  fn_int(td.get("deliveryQuantity")),
+        "delivery_pct":  fn(td.get("deliveryToTradedQuantity")),
+        "market_cap":    fn_int(md.get("totalMarketCap") or md.get("ffmc")),
+        "pe_ratio":      fn(md.get("pdSymbolPe")),
+        "week_52_high":  fn(w52.get("max")),
+        "week_52_low":   fn(w52.get("min")),
+        "sector":        ind.get("macro", ""),
+        "industry":      ind.get("sector", ""),
+        "isin":          sec.get("isin", ""),
+        "face_value":    fn(sec.get("faceVal")),
+        "series":        md.get("series", "EQ"),
+        "exchange": "NSE", "currency": "INR",
         "pb_ratio": None, "dividend_yield": None, "eps": None,
         "book_value": None, "debt_to_equity": None,
         "roe": None, "roa": None, "employees": None,
@@ -187,162 +182,218 @@ def _fetch_nse_quote(symbol: str) -> dict:
     }
 
 
-def _fetch_financials(symbol: str) -> dict:
-    """
-    Correct NSE endpoint:
-    GET /api/financial-results?index=equities&symbol=RELIANCE&period=Quarterly
-    Returns list of quarterly result objects.
-    """
-    try:
-        data = nse_get(
-            f"/api/financial-results?index=equities&symbol={symbol}&period=Quarterly"
-        )
-    except Exception as e:
-        return {"quarters": [], "error": str(e)}
-
-    # Response shape: {"data": [...]} or directly a list
-    rows = data.get("data", data) if isinstance(data, dict) else data
-    if not isinstance(rows, list):
-        return {"quarters": [], "error": "Unexpected response shape"}
-
-    quarters = []
-    for item in rows[:8]:
-        # NSE uses camelCase keys in financial-results
-        period = (
-            item.get("toDate") or item.get("period") or
-            item.get("to_date") or item.get("fromDate", "")
-        )
-        # Try multiple key variants NSE has used over time
-        income = fn(
-            item.get("totalIncome") or item.get("netSales") or
-            item.get("income") or item.get("revenue") or
-            item.get("totalRevenue") or item.get("netRevenue")
-        )
-        profit = fn(
-            item.get("netProfit") or item.get("profitAfterTax") or
-            item.get("pat") or item.get("profit")
-        )
-        ebitda = fn(item.get("ebitda") or item.get("operatingProfit") or item.get("pbdt"))
-        eps    = fn(item.get("eps") or item.get("basicEps") or item.get("dilutedEps"))
-
-        quarters.append({
-            "period": str(period)[:10] if period else "—",
-            "income": income,
-            "profit": profit,
-            "ebitda": ebitda,
-            "eps":    eps,
-        })
-
-    return {"quarters": quarters}
-
-
 def _fetch_shareholding(symbol: str) -> dict:
     """
-    Correct NSE endpoint:
-    GET /api/shareholding-patterns?index=equities&symbol=RELIANCE
-    Returns {"data": [...]} where each item has a 'shareHolding' list.
+    Correct endpoint discovered from nse library source:
+    /api/corporate-share-holdings-master?index=equities&symbol=SYMBOL
+    Returns a list of quarterly records with keys like pr_and_prgrp, public_val etc.
     """
     try:
-        data = nse_get(
-            f"/api/corporate-share-holdings-master?index=equities&symbol={symbol}"
+        rows = nse_get(
+            "/corporate-share-holdings-master",
+            {"index": "equities", "symbol": symbol}
         )
     except Exception as e:
         return {"history": [], "error": str(e)}
 
-    rows = data.get("data", []) if isinstance(data, dict) else data
     if not isinstance(rows, list):
-        return {"history": [], "error": "Unexpected response shape"}
+        rows = rows.get("data", []) if isinstance(rows, dict) else []
 
     history = []
     for rec in rows[:6]:
-        date = rec.get("date") or rec.get("period") or rec.get("quarter", "")
+        # Key field names from the nse library sample response
+        date_val = rec.get("date") or rec.get("quarter") or ""
 
-        # NSE nests shareholding under a 'shareHolding' array
-        # Each element has 'category' and 'percentage'
-        sh_list = rec.get("shareHolding") or rec.get("shareholding") or []
-
-        def find_pct(keywords):
-            """Search shareHolding list for a category matching any keyword."""
-            for item in sh_list:
-                cat = str(item.get("category", "") or item.get("name", "")).lower()
-                if any(k in cat for k in keywords):
-                    return fn(item.get("percentage") or item.get("per") or item.get("pct"))
-            # Fallback: direct keys on the record itself
-            for k in keywords:
-                v = rec.get(k) or rec.get(k.title()) or rec.get(k.upper())
+        def get_pct(keys):
+            for k in keys:
+                v = rec.get(k)
                 if v is not None:
                     return fn(v)
             return None
 
+        # NSE field names confirmed from library docs
+        promoter = get_pct(["pr_and_prgrp", "promoter", "promoterAndPromoterGroup"])
+        public   = get_pct(["public_val", "public", "publicVal"])
+        # FII/DII are usually inside a sub-list; try flat keys too
+        fii      = get_pct(["fii", "fpi", "foreIgnInst"])
+        dii      = get_pct(["dii", "domInstit"])
+        mf       = get_pct(["mutualFunds", "mutual_funds", "mf"])
+
+        # If sub-categories not in flat keys, try the nested shareHolderInfo list
+        sh_list = rec.get("shareHolderInfo") or rec.get("shareHolding") or []
+        for item in sh_list:
+            cat = str(item.get("category", "") or item.get("name", "")).lower()
+            pct = fn(item.get("percentage") or item.get("per") or item.get("pct"))
+            if "promoter" in cat and promoter is None:
+                promoter = pct
+            elif ("fii" in cat or "fpi" in cat or "foreign" in cat) and fii is None:
+                fii = pct
+            elif "dii" in cat and dii is None:
+                dii = pct
+            elif "mutual" in cat and mf is None:
+                mf = pct
+            elif "public" in cat and public is None:
+                public = pct
+
         history.append({
-            "date":        str(date)[:10],
-            "promoter":    find_pct(["promoter"]),
-            "fii":         find_pct(["fii", "fpi", "foreign institutional", "foreign portfolio"]),
-            "dii":         find_pct(["dii", "domestic institutional"]),
-            "mutual_fund": find_pct(["mutual fund", "mutual funds"]),
-            "public":      find_pct(["public", "retail"]),
+            "date":        str(date_val)[:10],
+            "promoter":    promoter,
+            "fii":         fii,
+            "dii":         dii,
+            "mutual_fund": mf,
+            "public":      public,
         })
 
     return {"history": history}
 
 
-def _date_str(d: datetime) -> str:
-    """NSE historical API wants dd-mm-yyyy format."""
-    return d.strftime("%d-%m-%Y")
-
-
-def _fetch_nse_history(symbol: str, days: int) -> list:
+def _scrape_screener(symbol: str) -> dict:
     """
-    NSE historical price data:
-    GET /api/historical/cm/equity?symbol=RELIANCE&series=["EQ"]&from=DD-MM-YYYY&to=DD-MM-YYYY
-    Returns {"data": [...]} with OHLCV rows.
+    Scrape Screener.in for quarterly financials.
+    URL: https://www.screener.in/company/RELIANCE/consolidated/
+    Returns structured quarterly P&L data.
     """
-    to_date   = datetime.now()
-    from_date = to_date - timedelta(days=days)
-    from_str  = _date_str(from_date)
-    to_str    = _date_str(to_date)
-
-    path = (
-        f'/api/historical/cm/equity?symbol={symbol}'
-        f'&series=["EQ"]&from={from_str}&to={to_str}'
+    client = httpx.Client(
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        follow_redirects=True,
+        timeout=20,
     )
-    data = nse_get(path)
-    rows = data.get("data", []) if isinstance(data, dict) else []
 
-    result = []
-    for row in rows:
-        # NSE field names
-        date_str = row.get("CH_TIMESTAMP") or row.get("mTIMESTAMP", "")
-        try:
-            dt = datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
-        except:
-            continue
-        result.append({
-            "time":   dt.isoformat(),
-            "open":   fn(row.get("CH_OPENING_PRICE") or row.get("open")),
-            "high":   fn(row.get("CH_TRADE_HIGH_PRICE") or row.get("high")),
-            "low":    fn(row.get("CH_TRADE_LOW_PRICE") or row.get("low")),
-            "close":  fn(row.get("CH_CLOSING_PRICE") or row.get("close") or row.get("CH_LAST_TRADED_PRICE")),
-            "volume": fn_int(row.get("CH_TOT_TRADED_QTY") or row.get("volume")),
-        })
+    quarters = []
+    try:
+        # Try consolidated first, fall back to standalone
+        for suffix in ["consolidated", ""]:
+            url = f"https://www.screener.in/company/{symbol}/" + (f"{suffix}/" if suffix else "")
+            r = client.get(url, timeout=15)
+            if r.status_code == 200 and "quarterly" in r.text.lower():
+                break
+        else:
+            return {"quarters": [], "error": "Screener page not found"}
 
-    # NSE returns newest first — reverse for charting
-    result.sort(key=lambda x: x["time"])
-    return result
+        html = r.text
+
+        # Find the Quarterly Results section
+        # Screener uses a table with id containing "quarters"
+        qr_match = re.search(
+            r'<section[^>]*id=["\']quarters["\'][^>]*>(.*?)</section>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        if not qr_match:
+            return {"quarters": [], "error": "Quarterly section not found on Screener"}
+
+        section = qr_match.group(1)
+
+        # Extract column headers (quarter dates)
+        header_matches = re.findall(r'<th[^>]*>(.*?)</th>', section, re.DOTALL)
+        headers = [re.sub(r'<[^>]+>', '', h).strip() for h in header_matches]
+        # First header is usually "Quarter" label, rest are dates
+        period_headers = [h for h in headers if re.search(r'\d{4}', h)]
+
+        # Extract each data row
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', section, re.DOTALL)
+
+        def parse_val(s):
+            s = re.sub(r'<[^>]+>', '', s).strip().replace(',', '').replace('%', '')
+            return fn(s)
+
+        row_data = {}
+        for row in rows:
+            cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL)
+            if not cells: continue
+            label = re.sub(r'<[^>]+>', '', cells[0]).strip().lower()
+            vals  = [parse_val(c) for c in cells[1:]]
+            if label:
+                row_data[label] = vals
+
+        # Map rows to standard keys
+        def get_row(*keys):
+            for k in keys:
+                for rk, rv in row_data.items():
+                    if k in rk:
+                        return rv
+            return []
+
+        sales   = get_row("sales", "revenue", "net sales")
+        profit  = get_row("net profit", "profit after tax", "pat")
+        ebitda  = get_row("operating profit", "ebitda", "ebidt")
+        eps_row = get_row("eps", "earning per share")
+
+        n = len(period_headers)
+        for i in range(min(n, 8)):
+            quarters.append({
+                "period": period_headers[i] if i < len(period_headers) else f"Q{i+1}",
+                "income": sales[i]   if i < len(sales)   else None,
+                "profit": profit[i]  if i < len(profit)  else None,
+                "ebitda": ebitda[i]  if i < len(ebitda)  else None,
+                "eps":    eps_row[i] if i < len(eps_row) else None,
+            })
+
+    except Exception as e:
+        return {"quarters": quarters, "error": str(e)}
+    finally:
+        client.close()
+
+    return {"quarters": quarters}
 
 
 def _fetch_history(symbol: str, period: str) -> list:
-    """Route to NSE historical API. Period → days mapping."""
-    days_map = {
-        "1d": 2,    # NSE intraday not available here; use 2-day OHLC
-        "1w": 7,
-        "1m": 35,
-        "3m": 95,
-        "1y": 370,
-        "5y": 1830,
-    }
+    """
+    Use NSE's NextApi endpoint (confirmed from nse library source):
+    /api/NextApi/apiClient/GetQuoteApi?functionName=getHistoricalTradeData
+    &symbol=X&series=EQ&fromDate=DD-MM-YYYY&toDate=DD-MM-YYYY
+    """
+    days_map = {"1d": 3, "1w": 8, "1m": 35, "3m": 95, "1y": 370, "5y": 1830}
     days = days_map.get(period, 35)
-    return _fetch_nse_history(symbol, days)
+
+    to_dt   = date.today()
+    fr_dt   = to_dt - timedelta(days=days)
+
+    # For long ranges, split into max 100-day chunks
+    results = []
+    chunk_start = fr_dt
+    while chunk_start <= to_dt:
+        chunk_end = min(chunk_start + timedelta(days=99), to_dt)
+        try:
+            data = nse_get(
+                "/NextApi/apiClient/GetQuoteApi",
+                {
+                    "functionName": "getHistoricalTradeData",
+                    "symbol":   symbol,
+                    "series":   "EQ",
+                    "fromDate": chunk_start.strftime("%d-%m-%Y"),
+                    "toDate":   chunk_end.strftime("%d-%m-%Y"),
+                }
+            )
+            # Response: {"data": [...]} — each row has mTIMESTAMP, CH_OPENING_PRICE etc.
+            rows = data.get("data", []) if isinstance(data, dict) else []
+            for row in rows:
+                ts = row.get("mTIMESTAMP") or row.get("CH_TIMESTAMP", "")
+                try:
+                    dt = datetime.strptime(str(ts)[:10], "%Y-%m-%d")
+                except:
+                    try:
+                        dt = datetime.strptime(str(ts)[:10], "%d-%b-%Y")
+                    except:
+                        continue
+                results.append({
+                    "time":   dt.isoformat(),
+                    "open":   fn(row.get("CH_OPENING_PRICE")  or row.get("open")),
+                    "high":   fn(row.get("CH_TRADE_HIGH_PRICE") or row.get("high")),
+                    "low":    fn(row.get("CH_TRADE_LOW_PRICE")  or row.get("low")),
+                    "close":  fn(row.get("CH_CLOSING_PRICE") or row.get("CH_LAST_TRADED_PRICE") or row.get("close")),
+                    "volume": fn_int(row.get("CH_TOT_TRADED_QTY") or row.get("volume")),
+                })
+        except Exception:
+            pass
+        chunk_start = chunk_end + timedelta(days=1)
+        time.sleep(0.2)
+
+    results.sort(key=lambda x: x["time"])
+    return results
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -397,7 +448,7 @@ async def get_stock(symbol: str):
     if cached: return cached
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(executor, _fetch_nse_quote, sym)
+        data = await loop.run_in_executor(executor, _fetch_quote, sym)
         cache_set(f"stock:{sym}", data, ttl=60)
         return data
     except Exception as e:
@@ -411,8 +462,9 @@ async def get_financials(symbol: str):
     if cached: return cached
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(executor, _fetch_financials, sym)
-        cache_set(f"fin:{sym}", data, ttl=3600)
+        data = await loop.run_in_executor(executor, _scrape_screener, sym)
+        if data.get("quarters"):
+            cache_set(f"fin:{sym}", data, ttl=7200)
         return data
     except Exception as e:
         raise HTTPException(500, f"Financials error {sym}: {e}")
@@ -426,7 +478,8 @@ async def get_shareholding(symbol: str):
     loop = asyncio.get_event_loop()
     try:
         data = await loop.run_in_executor(executor, _fetch_shareholding, sym)
-        cache_set(f"sh:{sym}", data, ttl=3600)
+        if data.get("history"):
+            cache_set(f"sh:{sym}", data, ttl=7200)
         return data
     except Exception as e:
         raise HTTPException(500, f"Shareholding error {sym}: {e}")
@@ -445,7 +498,5 @@ async def get_history(symbol: str, period: str = "1m"):
         ttl = 300 if period in ("1m", "3m", "1y", "5y") else 120
         cache_set(f"hist:{sym}:{period}", result, ttl=ttl)
         return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(500, str(e))
