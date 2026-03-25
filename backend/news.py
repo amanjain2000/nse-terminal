@@ -32,7 +32,7 @@ RSS_HEADERS = {
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 # ── RSS Fetching ──────────────────────────────────────────────────────────────
@@ -136,13 +136,13 @@ Return ONLY a JSON array, no markdown, no explanation outside the array:
 
 def _analyze_batch_llm(articles: list[dict], symbol: str, api_key: str) -> list[dict]:
     """
-    Send a batch of articles to Claude for PESTEL + sentiment analysis.
+    Send a batch of articles to Groq (free tier) for PESTEL + sentiment analysis.
+    Uses Llama 3.1 8B — fast, free, 14,400 req/day limit.
     Returns list of analysis results matching the input indices.
     """
     if not articles:
         return []
 
-    # Build the user message
     articles_text = ""
     for i, art in enumerate(articles):
         articles_text += f"\n[{i}] SOURCE: {art['source']}\nTITLE: {art['title']}\nSUMMARY: {art['summary']}\n"
@@ -154,22 +154,25 @@ def _analyze_batch_llm(articles: list[dict], symbol: str, api_key: str) -> list[
     )
 
     headers = {
-        "x-api-key":         api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type":      "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type":  "application/json",
     }
+    # Groq uses OpenAI-compatible chat completions format
     body = {
-        "model":      "claude-sonnet-4-20250514",
-        "max_tokens": 2000,
-        "system":     ANALYSIS_SYSTEM_PROMPT,
-        "messages":   [{"role": "user", "content": user_msg}],
+        "model":       "llama-3.1-8b-instant",   # free, fast, very capable
+        "max_tokens":  2000,
+        "temperature": 0.1,   # low temp = more consistent JSON output
+        "messages": [
+            {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user",   "content": user_msg},
+        ],
     }
 
     try:
-        r = httpx.post(ANTHROPIC_API_URL, headers=headers, json=body, timeout=30)
+        r = httpx.post(GROQ_API_URL, headers=headers, json=body, timeout=30)
         r.raise_for_status()
         resp = r.json()
-        text = resp["content"][0]["text"].strip()
+        text = resp["choices"][0]["message"]["content"].strip()
 
         # Strip markdown fences if present
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -181,7 +184,7 @@ def _analyze_batch_llm(articles: list[dict], symbol: str, api_key: str) -> list[
     except Exception:
         pass
 
-    # Fallback: return neutral analysis for all articles
+    # Fallback: neutral for all if Groq call fails
     return [{"index": i, "pestel_categories": [], "sentiment": "neutral",
              "sentiment_score": 0.0, "reasoning": "Analysis unavailable."}
             for i in range(len(articles))]
