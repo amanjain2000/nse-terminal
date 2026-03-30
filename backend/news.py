@@ -134,7 +134,7 @@ Return ONLY a JSON array, no markdown, no explanation outside the array:
 ]"""
 
 
-def _analyze_batch_llm(articles: list[dict], symbol: str, GROQ_API_KEY: str) -> list[dict]:
+def _analyze_batch_llm(articles: list[dict], symbol: str, api_key: str) -> list[dict]:
     """
     Send a batch of articles to Groq (free tier) for PESTEL + sentiment analysis.
     Uses Llama 3.1 8B — fast, free, 14,400 req/day limit.
@@ -154,7 +154,7 @@ def _analyze_batch_llm(articles: list[dict], symbol: str, GROQ_API_KEY: str) -> 
     )
 
     headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type":  "application/json",
     }
     # Groq uses OpenAI-compatible chat completions format
@@ -190,7 +190,7 @@ def _analyze_batch_llm(articles: list[dict], symbol: str, GROQ_API_KEY: str) -> 
             for i in range(len(articles))]
 
 
-def _analyze_all_articles(articles: list[dict], symbol: str, GROQ_API_KEY: str,
+def _analyze_all_articles(articles: list[dict], symbol: str, api_key: str,
                           batch_size: int = 10) -> list[dict]:
     """
     Process all articles through LLM in batches of `batch_size`.
@@ -199,7 +199,7 @@ def _analyze_all_articles(articles: list[dict], symbol: str, GROQ_API_KEY: str,
     annotated = []
     for start in range(0, len(articles), batch_size):
         batch = articles[start: start + batch_size]
-        llm_results = _analyze_batch_llm(batch, symbol, GROQ_API_KEY)
+        llm_results = _analyze_batch_llm(batch, symbol, api_key)
 
         # Build a lookup by index
         llm_by_idx = {r.get("index", i): r for i, r in enumerate(llm_results)}
@@ -226,7 +226,7 @@ def _analyze_all_articles(articles: list[dict], symbol: str, GROQ_API_KEY: str,
 def fetch_news_for_symbol(
     symbol: str,
     company_name: str,
-    GROQ_API_KEY: str,
+    api_key: str,
     max_items: int = 30,
     min_relevance: float = 1.0,
 ) -> dict:
@@ -267,8 +267,8 @@ def fetch_news_for_symbol(
     candidates = with_relevance[:max_items]
 
     # Step 3: LLM analysis
-    if GROQ_API_KEY and candidates:
-        annotated = _analyze_all_articles(candidates, symbol, GROQ_API_KEY)
+    if api_key and candidates:
+        annotated = _analyze_all_articles(candidates, symbol, api_key)
     else:
         # No API key — return articles without PESTEL analysis
         annotated = [{**art, "pestel_categories": [], "sentiment": "neutral",
@@ -323,7 +323,7 @@ def compute_pestel_scores(news_items: list[dict]) -> dict:
     return scores
 
 
-def get_macro_pestel(GROQ_API_KEY: str) -> dict:
+def get_macro_pestel(api_key: str) -> dict:
     """
     Market-wide PESTEL from general market news (no stock filter).
     """
@@ -340,8 +340,8 @@ def get_macro_pestel(GROQ_API_KEY: str) -> dict:
         if item.get("title")
     ]
 
-    if GROQ_API_KEY and candidates:
-        annotated = _analyze_all_articles(candidates, "MACRO", GROQ_API_KEY, batch_size=15)
+    if api_key and candidates:
+        annotated = _analyze_all_articles(candidates, "MACRO", api_key, batch_size=15)
     else:
         annotated = [{**art, "pestel_categories": [], "sentiment": "neutral",
                       "sentiment_score": 0.0, "reasoning": ""}
