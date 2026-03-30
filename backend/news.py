@@ -38,24 +38,44 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 # ── RSS Fetching ──────────────────────────────────────────────────────────────
 
 def _fetch_rss(feed: dict, timeout: int = 8) -> list[dict]:
+    """Fetch one RSS feed. Always returns a list, never raises."""
     try:
-        r = httpx.get(feed["url"], headers=RSS_HEADERS, timeout=timeout, follow_redirects=True)
+        r = httpx.get(
+            feed["url"], headers=RSS_HEADERS,
+            timeout=httpx.Timeout(connect=5.0, read=timeout, write=5.0, pool=5.0),
+            follow_redirects=True,
+        )
         if r.status_code != 200:
             return []
-        root = ET.fromstring(r.content)
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
+
+        content = r.content
+        if not content:
+            return []
+
+        # Some feeds return non-UTF8 — decode safely
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            # Try stripping bad bytes
+            text = content.decode("utf-8", errors="replace")
+            text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text)
+            root = ET.fromstring(text.encode("utf-8"))
+
+        ns    = {"atom": "http://www.w3.org/2005/Atom"}
         items = []
 
+        # RSS 2.0
         for item in root.findall(".//item"):
-            title   = (item.findtext("title") or "").strip()
-            desc    = re.sub(r"<[^>]+>", " ", item.findtext("description") or "").strip()
-            desc    = re.sub(r"\s+", " ", desc)[:350]
-            link    = (item.findtext("link") or "").strip()
-            pub     = (item.findtext("pubDate") or "").strip()
+            title = (item.findtext("title") or "").strip()
+            desc  = re.sub(r"<[^>]+>", " ", item.findtext("description") or "").strip()
+            desc  = re.sub(r"\s+", " ", desc)[:350]
+            link  = (item.findtext("link") or "").strip()
+            pub   = (item.findtext("pubDate") or "").strip()
             if title:
                 items.append({"title": title, "summary": desc, "url": link,
                               "source": feed["name"], "published": pub})
 
+        # Atom fallback
         if not items:
             for entry in root.findall("atom:entry", ns):
                 title   = (entry.findtext("atom:title", namespaces=ns) or "").strip()
@@ -67,9 +87,10 @@ def _fetch_rss(feed: dict, timeout: int = 8) -> list[dict]:
                 if title:
                     items.append({"title": title, "summary": summary, "url": link,
                                   "source": feed["name"], "published": pub})
+
         return items
     except Exception:
-        return []
+        return []   # always swallow — one broken feed must not kill the whole pipeline
 
 
 def _relevance_prefilter(item: dict, symbol: str, company_name: str) -> float:
@@ -231,12 +252,25 @@ def fetch_news_for_symbol(
     min_relevance: float = 1.0,
 ) -> dict:
     """
-    1. Fetch all RSS feeds in parallel (no API key needed)
+    1. Fetch all RSS feeds (failures are silently skipped)
     2. Pre-filter by relevance to the symbol
-    3. Send relevant articles to Claude for PESTEL + sentiment
+    3. Send relevant articles to Groq/LLM for PESTEL + sentiment
     4. Compute aggregate PESTEL scores
     Returns: {"news": [...], "pestel": {...}}
     """
+    try:
+        return _fetch_news_inner(symbol, company_name, api_key, max_items, min_relevance)
+    except Exception as e:
+        return {"news": [], "pestel": {}, "error": str(e)}
+
+
+def _fetch_news_inner(
+    symbol: str,
+    company_name: str,
+    api_key: str,
+    max_items: int = 30,
+    min_relevance: float = 1.0,
+) -> dict:
     # Step 1: Fetch all feeds
     all_raw = []
     for feed in RSS_FEEDS:
