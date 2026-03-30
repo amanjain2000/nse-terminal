@@ -6,6 +6,7 @@ import time
 import json
 import gzip
 import re
+import os
 from datetime import datetime, timedelta, date
 from concurrent.futures import ThreadPoolExecutor
 from stocks_list import NSE_STOCKS
@@ -624,8 +625,7 @@ async def get_history(symbol: str, period: str = "1m"):
 # ── Phase 3: News & PESTEL routes ─────────────────────────────────────────────
 from news import fetch_news_for_symbol, compute_pestel_scores, get_macro_pestel
 
-def _get_api_key() -> str:
-    """Read Anthropic API key from environment variable."""
+def _get_groq_key() -> str:
     return os.environ.get("GROQ_API_KEY", "")
 
 
@@ -636,7 +636,7 @@ async def get_stock_news(symbol: str):
     if cached:
         return cached
 
-    api_key      = _get_api_key()
+    api_key      = _get_groq_key()
     stock_cached = cache_get(f"stock:{sym}")
     company_name = stock_cached.get("name", sym) if stock_cached else sym
 
@@ -646,12 +646,45 @@ async def get_stock_news(symbol: str):
             executor,
             lambda: fetch_news_for_symbol(sym, company_name, api_key)
         )
-        result["symbol"]     = sym
+        result["symbol"]      = sym
         result["llm_enabled"] = bool(api_key)
-        cache_set(f"news:{sym}", result, ttl=600)   # 10 min
+        if result.get("news") is not None:   # cache even if empty
+            cache_set(f"news:{sym}", result, ttl=600)
         return result
     except Exception as e:
-        raise HTTPException(500, f"News error for {sym}: {e}")
+        # Never return 500 — return empty result with error info so UI shows something
+        return {
+            "symbol": sym, "llm_enabled": False,
+            "news": [], "pestel": {},
+            "error": str(e),
+        }
+
+
+@app.get("/api/stock/{symbol}/news/debug")
+async def debug_news(symbol: str):
+    """Debug endpoint — shows RSS fetch results and any errors without LLM."""
+    sym = symbol.upper().strip()
+    from news import RSS_FEEDS, _fetch_rss, _relevance_prefilter
+    stock_cached = cache_get(f"stock:{sym}")
+    company_name = stock_cached.get("name", sym) if stock_cached else sym
+
+    feed_results = []
+    for feed in RSS_FEEDS[:5]:   # test first 5 feeds
+        try:
+            items = _fetch_rss(feed, timeout=8)
+            relevant = [i for i in items if _relevance_prefilter(i, sym, company_name) >= 1.0]
+            feed_results.append({
+                "feed": feed["name"], "fetched": len(items),
+                "relevant": len(relevant), "status": "ok",
+            })
+        except Exception as ex:
+            feed_results.append({"feed": feed["name"], "status": f"error: {ex}"})
+
+    return {
+        "symbol": sym, "company": company_name,
+        "groq_key_set": bool(os.environ.get("GROQ_API_KEY")),
+        "feeds": feed_results,
+    }
 
 
 @app.get("/api/macro/pestel")
@@ -659,15 +692,14 @@ async def get_macro():
     cached = cache_get("macro_pestel")
     if cached:
         return cached
-
-    api_key = _get_api_key()
+    api_key = _get_groq_key()
     loop    = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(
             executor,
             lambda: get_macro_pestel(api_key)
         )
-        cache_set("macro_pestel", result, ttl=1800)  # 30 min
+        cache_set("macro_pestel", result, ttl=1800)
         return result
     except Exception as e:
-        raise HTTPException(500, f"Macro PESTEL error: {e}")
+        return {"error": str(e)}
